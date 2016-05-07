@@ -1,0 +1,11 @@
+[package]
+name = "i3-tmux-integration"
+version = "0.1.0"
+authors = ["roblabla <robinlambertz+dev@gmail.com>"]
+
+[dependencies]
+pty = "*"
+libc = "*"
+termios = "*"
+twoway = "*"
+chan = "*"
