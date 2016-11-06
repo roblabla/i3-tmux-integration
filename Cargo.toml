@@ -6,6 +6,9 @@ authors = ["roblabla <robinlambertz+dev@gmail.com>"]
 [dependencies]
 pty = "*"
 libc = "*"
-termios = "*"
+termion = "*"
 twoway = "*"
 chan = "*"
+log = "*"
+fern = "*"
+i3ipc = "*"
