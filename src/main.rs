@@ -23,7 +23,7 @@ use std::env;
 use std::path::PathBuf;
 use std::ptr;
 use std::io::{self, Read, Write};
-use std::ffi::CString;
+use std::ffi::{CString, CStr};
 use std::thread;
 use termion::raw::IntoRawMode;
 use std::os::unix::ffi::OsStringExt;
@@ -242,7 +242,18 @@ fn main() {
             }
         }
     } else {
-        let cmd = CString::new(env::args_os().nth(1).unwrap().into_vec()).unwrap();
+        let hold_cstring : CString;
+        let cmd = unsafe {
+            if let Some(str) = env::args_os().nth(1) {
+                hold_cstring = CString::new(str.into_vec()).unwrap();
+                &hold_cstring
+            } else if let Some(passwd) = libc::getpwuid(libc::getuid()).as_ref() {
+                CStr::from_ptr(passwd.pw_shell)
+            } else {
+                // TODO: exit cleanly, saying something's WRONG
+                unreachable!()
+            }
+        };
         let args = [cmd.as_ptr(), ptr::null()].as_mut_ptr();
         unsafe { libc::execvp(cmd.as_ptr(), args) };
     }
