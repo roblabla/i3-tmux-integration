@@ -27,6 +27,7 @@ use std::ffi::CString;
 use std::thread;
 use termion::raw::IntoRawMode;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::io::RawFd;
 use pty::fork::*;
 
 const TMUX_DEC : [u8; 7]= [0o33, 'P' as u8, '1' as u8, '0' as u8, '0' as u8, '0' as u8, 'p' as u8];
@@ -74,7 +75,7 @@ impl InputModes {
                         None => continue
                     };
                     let args : Vec<&str> = iter.collect();
-                    info!("Command : {} {:?}", 
+                    info!("Command : {} {:?}", cmd, args);
                     match cmd {
                         "%begin" => (),
                         "%exit" => {
