@@ -1,23 +1,27 @@
-#[macro_use]
-extern crate log;
-extern crate termion;
-#[macro_use]
-extern crate chan;
+extern crate backtrace;
+extern crate nix;
 extern crate byteorder;
-extern crate sendfd;
 
-use sendfd::UnixSendFd;
-use byteorder::{NativeEndian};
+use byteorder::{WriteBytesExt, NativeEndian};
+use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+use nix::sys::uio::IoVec;
 use std::os::unix::net::UnixDatagram;
-use termion::raw::IntoRawMode;
-use std::thread;
-use std::io::{Read, Write};
-
+use std::os::unix::io::{AsRawFd};
+use std::io::Cursor;
 
 fn main() {
-    let path = std::env::args_os().nth(1);
-    //let socket = UnixDatagram::connect();
-    /*socket.sendfd(0);
-    socket.sendfd(1);
-    socket.sendfd(2);*/
+    let path = std::env::args().nth(1).unwrap();
+    let paneid = std::env::args().nth(2).unwrap().parse::<u64>().unwrap();
+    let socket = UnixDatagram::unbound().unwrap();
+    let mut slice = [0u8; 8];
+    Cursor::new(slice.as_mut()).write_u64::<NativeEndian>(paneid).unwrap();
+    let iov = [IoVec::from_slice(&slice)];
+    let arr = [0, 1];
+    let cmsg = [ControlMessage::ScmRights(&arr[0..2])];
+    socket.connect(path).unwrap();
+    sendmsg(socket.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None).unwrap();
+    loop {
+        // Keep looping for daaays
+        std::thread::sleep(std::time::Duration::new(60 * 60 * 24, 0));
+    }
 }
