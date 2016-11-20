@@ -77,7 +77,9 @@ impl Pane {
     pub fn new(id: u64, path: &PathBuf, ipc: &mut I3Connection) -> Pane {
         let (tx, rx) = chan::async();
         // Start the terminal on creation.
-        let running = format!("workspace tmp; exec RUST_BACKTRACE=1 i3-sensible-terminal --hold -e /home/roblabla/i3-tmux-integration/target/debug/tmux-integration-window {} {}", path.display(), id);
+        let mut exepath = std::env::current_exe().unwrap();
+        exepath.set_file_name("tmux-integration-window");
+        let running = format!("workspace tmp; exec RUST_BACKTRACE=1 i3-sensible-terminal --hold -e {} {} {}", exepath.display(), path.display(), id);
         ipc.command(&running).unwrap();
         Pane {
             id: id,
