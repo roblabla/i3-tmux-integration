@@ -6,14 +6,15 @@ authors = ["roblabla <robinlambertz+dev@gmail.com>"]
 [dependencies]
 pty = "*"
 libc = "*"
-termion = "*"
+termios = "*"
 twoway = "*"
 chan = "*"
 log = "*"
 fern = "*"
 i3ipc = "*"
 byteorder = "*"
-nix = "*"
+nix = { git = "https://github.com/roblabla/nix", branch = "bugfix-multipleFdInCmsg" }
 nom = "*"
 tempdir = "*"
 backtrace = "*"
+unescape = "*"

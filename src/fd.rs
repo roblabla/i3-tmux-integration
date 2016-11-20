@@ -1,10 +1,16 @@
 use std::io::{Read, Write, Result};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{RawFd, AsRawFd};
 use libc::{self, c_void};
 use std;
 
 #[derive(Debug)]
-pub struct Fd(pub RawFd);
+pub struct Fd(RawFd);
+
+impl Fd {
+    pub fn new(fd: RawFd) -> Fd {
+        Fd(fd)
+    }
+}
 
 impl Read for Fd {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -33,5 +39,11 @@ impl Write for Fd {
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+impl AsRawFd for Fd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
     }
 }

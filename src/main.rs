@@ -1,6 +1,6 @@
 extern crate pty;
 extern crate libc;
-extern crate termion;
+extern crate termios as raw_termios;
 extern crate tempdir;
 extern crate twoway;
 #[macro_use(chan_select)]
@@ -13,10 +13,15 @@ extern crate byteorder;
 #[macro_use]
 extern crate nom;
 extern crate nix;
+extern crate unescape;
 
 mod layout;
 mod fd;
+mod termios;
 
+use unescape::unescape;
+use termios::Termios;
+use fd::Fd;
 use std::os::unix::net::UnixDatagram;
 use std::os::unix::io::AsRawFd;
 use std::collections::HashMap;
@@ -26,10 +31,10 @@ use std::path::{PathBuf, Path};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::io::{self, Read, Write, Cursor};
+use std::io::{self, Read, Write, Cursor, ErrorKind};
+use std::os::unix::thread::JoinHandleExt;
 use std::ffi::{CString, CStr};
 use std::thread;
-use termion::raw::IntoRawMode;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::RawFd;
 use pty::fork::*;
@@ -58,12 +63,21 @@ struct Pane {
     thread_write: Option<std::thread::JoinHandle<()>>
 }
 
+impl Drop for Pane {
+    fn drop(&mut self) {
+        // Make sure everything gets closed.
+        if let Some(thread) = self.thread_read.take() {
+            unsafe { libc::pthread_kill(thread.as_pthread_t(), libc::SIGINT); }
+            thread.join().unwrap();
+        }
+    }
+}
+
 impl Pane {
     pub fn new(id: u64, path: &PathBuf, ipc: &mut I3Connection) -> Pane {
         let (tx, rx) = chan::async();
         // Start the terminal on creation.
         let running = format!("workspace tmp; exec RUST_BACKTRACE=1 i3-sensible-terminal --hold -e /home/roblabla/i3-tmux-integration/target/debug/tmux-integration-window {} {}", path.display(), id);
-        println!("{}", running);
         ipc.command(&running).unwrap();
         Pane {
             id: id,
@@ -100,8 +114,8 @@ impl InputModes {
                 for mut line in bytes.split(|&e| e == '\n' as u8) {
                     size += line.len() + 1;
                     // TODO: figure out what happens in case it's not utf8
-                    if line.len() > 0 && line[0] == b'\r' {
-                        line = &line[1..]
+                    if line.len() > 0 && line[line.len() - 1] == b'\r' {
+                        line = &line[..line.len() - 1];
                     }
                     let mut iter = std::str::from_utf8(line).unwrap().split(' ');
                     let cmd = match iter.next() {
@@ -109,10 +123,14 @@ impl InputModes {
                         None => continue
                     };
                     let args : Vec<&str> = iter.collect();
-                    info!("Command : {} {:?}", cmd, args);
+                    info!("Command : '{}' {:?}", cmd, args);
                     match cmd {
                         "%begin" => (),
                         "%exit" => {
+                            {
+                                let mut lock = panes.lock().unwrap();
+                                lock.clear();
+                            }
                             self = InputModes::LookingForTmuxDec(ipc, path, panes);
                             return self.handle_input(&bytes[size..]);
                         },
@@ -127,7 +145,11 @@ impl InputModes {
                             let paneid = args[0][1..].parse::<u64>().unwrap();
                             let mut lock = panes.lock().unwrap();
                             let pane = lock.entry(paneid).or_insert_with(|| Pane::new(paneid, &*path, &mut ipc));
-                            pane.output.send(args[1..].iter().fold("".to_string(), |mut acc, &x| { acc.push_str(x); acc }));
+                            pane.output.send(args[2..].iter().fold(unescape(args[1]).unwrap(), |mut acc, &x| {
+                                acc.push_str(" ");
+                                acc.push_str(&unescape(x).unwrap());
+                                acc
+                            }));
                         },
                         "%session-changed" => (),
                         "%session-renamed" => (),
@@ -142,7 +164,7 @@ impl InputModes {
                         "%window-close" => (),
                         "%window-renamed" => (),
                         cmd => {
-                            info!("Unknown command \"{:?}\"", line);
+                            info!("Unknown command");
                         }
                     }
                 }
@@ -174,6 +196,7 @@ fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<Path
         let mut bytes = [0u8; 4096];
         loop {
             let read = match pty_master.read(&mut bytes) {
+                Ok(0) => break,
                 Ok(read) => read,
                 Err(_) => {
                     info!("Got an error reading from stdin");
@@ -187,6 +210,7 @@ fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<Path
         let mut bytes = [0u8; 4096];
         loop {
             let read = match io::stdin().read(&mut bytes) {
+                Ok(0) => break,
                 Ok(read) => read,
                 Err(_) => {
                     info!("Got an error reading from stdout");
@@ -205,13 +229,15 @@ fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<Path
             let (paneid, fds) = match recvmsg(datagram.as_raw_fd(), &iovec, Some(&mut space), MsgFlags::empty()) {
                 Ok(msg) => {
                     if let Some(ControlMessage::ScmRights(fds)) = msg.cmsgs().next() {
-                        println!("{:?}", fds);
                         (Cursor::new(iovec[0].as_slice()).read_u64::<NativeEndian>().unwrap(), fds.to_vec())
                     } else {
                         info!("Got an error reading from unix socket");
                         break
                     }
                 },
+                Err(nix::Error::Sys(nix::Errno::EINTR)) => {
+                    break
+                }
                 Err(_) => {
                     info!("Got an error reading from unix socket");
                     break
@@ -219,32 +245,42 @@ fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<Path
             };
             let mut lock = panes.lock().unwrap();
             if let Some(pane) = lock.get_mut(&paneid) {
-                //TODO: put those f-ds into raw mode
-                let mut write_fd = fd::Fd(fds[1]);
-                let mut read_fd = fd::Fd(fds[0]);
+                let mut write_fd = Fd::new(fds[1]);
+                let mut read_fd = Fd::new(fds[0]);
                 pane.thread_read = Some(std::thread::spawn(move || {
                     let mut bytes = [0u8; 4096];
                     loop {
+                        println!("Reading !");
                         match read_fd.read(&mut bytes) {
+                            Ok(0) => break,
                             Ok(siz) => {
-                                // This is where things goes to shit !
-                                write!(pty_master, "send-keys {}", to_hex(&bytes[..siz])).unwrap();
+                                let bytes = to_hex(&bytes[..siz]);
+                                info!("Writing {}", bytes);
+                                write!(pty_master, "send-keys {}\n", bytes).unwrap();
                             },
+                            Err(ref e) if e.kind() == ErrorKind::Interrupted => break,
                             Err(_) => {
-                                // TODO: ?
+                                info!("Got an error reading from read thread");
+                                break
                             }
                         };
                     }
+                    println!("Broke out of the loop!");
                 }));
-                /*let rx = pane._read.take().unwrap();
+                let rx = pane._read.take().unwrap();
                 pane.thread_write = Some(std::thread::spawn(move || {
+                    let mut write_fd_raw = Termios::new(write_fd).unwrap();
+                    write_fd_raw.set_raw_mode().unwrap();
                     loop {
                         match rx.recv() {
-                            Some(string) => write_fd.write_all(string.as_bytes()).unwrap(),
+                            Some(string) => {
+                                println!("{:?}\r", string.as_bytes());
+                                write_fd_raw.write_all(string.as_bytes()).unwrap()
+                            },
                             None => break
                         }
                     }
-                }));*/
+                }));
             }
         }
     });
@@ -256,17 +292,18 @@ fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<Path
 }
 
 fn to_hex(bytes: &[u8]) -> String {
-    let mut mystr = String::with_capacity(bytes.len() * 3);
+    let mut mystr = String::with_capacity(bytes.len() * 5);
     for byte in bytes {
+        mystr.push_str("0x");
         if (byte >> 4) < 10u8 {
             mystr.push(((byte >> 4) + b'0') as char)
         } else {
-            mystr.push(((byte >> 4) + b'a') as char)
+            mystr.push(((byte >> 4) - 10u8 + b'a') as char)
         }
         if (byte & 0xf) < 10u8 {
             mystr.push(((byte & 0xf) + b'0') as char)
         } else {
-            mystr.push(((byte & 0xf) + b'a') as char)
+            mystr.push(((byte & 0xf) - 10u8 + b'a') as char)
         }
         mystr.push(' ');
     }
@@ -276,35 +313,29 @@ fn to_hex(bytes: &[u8]) -> String {
 fn main() {
     let logger_config = fern::DispatchConfig {
         format: Box::new(|msg, _, _| {
-            format!("{}", msg)
+            format!("{}\r", msg)
         }),
-        output: vec![fern::OutputConfig::file("output.log")],
+        output: vec![fern::OutputConfig::stdout()],
         level: log::LogLevelFilter::Trace
     };
     fern::init_global_logger(logger_config, log::LogLevelFilter::Trace).unwrap();
 
     let tempdir = tempdir::TempDir::new("i3-tmux").unwrap();
     let tempsock = Arc::new(tempdir.path().join("server.sock"));
-    println!("{}", tempsock.display());
     let map = Arc::new(Mutex::new(HashMap::new()));
 
     let ipc = match I3Connection::connect() {
         Ok(ipc) => ipc,
         Err(err) => {
             write!(std::io::stderr(), "Error connecting to i3 IPC! {}\n", err).unwrap();
-            let args : Vec<CString> = env::args_os().skip(1).map(|e| CString::new(e.into_vec()).unwrap()).collect();
-            let mut args_ptrs : Vec<_> = args.iter().map(|e| e.as_ptr()).collect();
-            args_ptrs.push(ptr::null());
-            let args_ptr = args_ptrs.as_ptr();
-            let cmd = args_ptrs[0];
-            unsafe { libc::execvp(cmd, args_ptr) };
-            unreachable!();
+            return;
         }
     };
 
     let mut fork = Fork::from_ptmx().unwrap();
     if let Fork::Parent(pid, ref mut master) = fork {
-        let mut raw_stdout = std::io::stdout().into_raw_mode().unwrap();
+        let mut raw_termios = Termios::new(Fd::new(0)).unwrap();
+        raw_termios.set_raw_mode().unwrap();
         let (input, output, close) = readers(master.clone(), pid, tempsock.clone(), map.clone());
         let mut input_mode = InputModes::LookingForTmuxDec(ipc, tempsock.clone(), map.clone());
         loop {
