@@ -2,6 +2,8 @@ extern crate backtrace;
 extern crate nix;
 extern crate byteorder;
 
+mod termsize;
+
 use byteorder::{WriteBytesExt, NativeEndian};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use nix::sys::uio::IoVec;
@@ -10,6 +12,7 @@ use std::os::unix::io::{AsRawFd};
 use std::io::Cursor;
 
 fn main() {
+    let signal = chan_signal::notify(&[chan_signal::Signal::WINCH]);
     let path = std::env::args().nth(1).unwrap();
     let paneid = std::env::args().nth(2).unwrap().parse::<u64>().unwrap();
     let socket = UnixDatagram::unbound().unwrap();
@@ -21,7 +24,6 @@ fn main() {
     socket.connect(path).unwrap();
     sendmsg(socket.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None).unwrap();
     loop {
-        // Keep looping for daaays
-        std::thread::sleep(std::time::Duration::new(60 * 60 * 24, 0));
+        signal.recv().unwrap();
     }
 }

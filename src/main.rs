@@ -5,6 +5,7 @@ extern crate tempdir;
 extern crate twoway;
 #[macro_use(chan_select)]
 extern crate chan;
+extern crate chan_signal;
 #[macro_use]
 extern crate log;
 extern crate fern;
@@ -12,13 +13,16 @@ extern crate i3ipc;
 extern crate byteorder;
 #[macro_use]
 extern crate nom;
+#[macro_use]
 extern crate nix;
 extern crate unescape;
 
 mod layout;
 mod fd;
 mod termios;
+mod termsize;
 
+use termsize::{get_terminal_size, set_terminal_size};
 use unescape::unescape;
 use termios::Termios;
 use fd::Fd;
@@ -38,7 +42,9 @@ use std::thread;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::RawFd;
 use pty::fork::*;
+use libc::{STDIN_FILENO, STDOUT_FILENO};
 use nix::sys::socket::{recvmsg, MsgFlags, CmsgSpace, ControlMessage};
+use nix::sys::signal::Signal;
 use nix::sys::uio::{IoVec};
 use byteorder::{ReadBytesExt, NativeEndian};
 
@@ -55,18 +61,36 @@ struct Pane {
     id: u64,
     x11win: Option<u64>,
     signal_fd: Option<fd::Fd>,
-    output: chan::Sender<String>,
     // Need to store the rx side until the thread is created when we
     // receive stuff on the unix socket...
-    _read: Option<chan::Receiver<String>>,
-    thread_read: Option<std::thread::JoinHandle<()>>,
-    thread_write: Option<std::thread::JoinHandle<()>>
+    _to_write: Vec<Vec<u8>>,
+    _thread_read: Option<std::thread::JoinHandle<()>>,
+    write: Option<termios::Termios<fd::Fd>>
+}
+
+impl Write for Pane {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(ref mut fd) = self.write {
+            fd.write(buf)
+        } else {
+            self._to_write.push(buf.into());
+            Ok(buf.len())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(ref mut fd) = self.write {
+            fd.flush()
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for Pane {
     fn drop(&mut self) {
         // Make sure everything gets closed.
-        if let Some(thread) = self.thread_read.take() {
+        if let Some(thread) = self._thread_read.take() {
             unsafe { libc::pthread_kill(thread.as_pthread_t(), libc::SIGINT); }
             thread.join().unwrap();
         }
@@ -75,7 +99,6 @@ impl Drop for Pane {
 
 impl Pane {
     pub fn new(id: u64, path: &PathBuf, ipc: &mut I3Connection) -> Pane {
-        let (tx, rx) = chan::async();
         // Start the terminal on creation.
         let mut exepath = std::env::current_exe().unwrap();
         exepath.set_file_name("tmux-integration-window");
@@ -85,10 +108,9 @@ impl Pane {
             id: id,
             x11win: None,
             signal_fd: None,
-            output: tx,
-            _read: Some(rx),
-            thread_read: None,
-            thread_write: None
+            _to_write: vec![],
+            _thread_read: None,
+            write: None
         }
     }
 }
@@ -147,11 +169,11 @@ impl InputModes {
                             let paneid = args[0][1..].parse::<u64>().unwrap();
                             let mut lock = panes.lock().unwrap();
                             let pane = lock.entry(paneid).or_insert_with(|| Pane::new(paneid, &*path, &mut ipc));
-                            pane.output.send(args[2..].iter().fold(unescape(args[1]).unwrap(), |mut acc, &x| {
+                            pane.write(&args[2..].iter().fold(unescape(args[1]).unwrap(), |mut acc, &x| {
                                 acc.push_str(" ");
                                 acc.push_str(&unescape(x).unwrap());
                                 acc
-                            }));
+                            }).into_bytes()[..]);
                         },
                         "%session-changed" => (),
                         "%session-renamed" => (),
@@ -190,10 +212,11 @@ fn print_tmux_msg() {
 }
 
 // TODO: Figure out safe, correct way to send a slice via chan.
-fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<PathBuf>, panes: Arc<Mutex<HashMap<u64, Pane>>>) -> (chan::Receiver<([u8;4096], usize)>, chan::Receiver<([u8;4096], usize)>, chan::Receiver<()>) {
+fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<PathBuf>, panes: Arc<Mutex<HashMap<u64, Pane>>>) -> (chan::Receiver<([u8;4096], usize)>, chan::Receiver<([u8;4096], usize)>, chan::Receiver<()>, chan::Receiver<(u64, [u8;4096], usize)>) {
     let (tx1, rx1) = chan::sync(0); // TODO: might want to make this a sync channel instead of rdv
     let (tx2, rx2) = chan::sync(0);
     let (tx3, rx3) = chan::sync(0);
+    let (tx4, rx4) = chan::sync(0);
     thread::spawn(move || {
         let mut bytes = [0u8; 4096];
         loop {
@@ -247,19 +270,24 @@ fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<Path
             };
             let mut lock = panes.lock().unwrap();
             if let Some(pane) = lock.get_mut(&paneid) {
-                let mut write_fd = Fd::new(fds[1]);
+                let mut raw_fd = Termios::new(Fd::new(fds[1])).unwrap();
+                raw_fd.set_raw_mode().unwrap();
+                pane.write = Some(raw_fd);
+                let mut _to_write = vec![];
+                std::mem::swap(&mut _to_write, &mut pane._to_write);
+                for bytes in _to_write.iter() {
+                    pane.write(bytes);
+                }
+                pane._to_write = vec![];
                 let mut read_fd = Fd::new(fds[0]);
-                pane.thread_read = Some(std::thread::spawn(move || {
+                let tx4_clone = tx4.clone();
+                pane._thread_read = Some(std::thread::spawn(move || {
                     let mut bytes = [0u8; 4096];
                     loop {
                         println!("Reading !");
                         match read_fd.read(&mut bytes) {
                             Ok(0) => break,
-                            Ok(siz) => {
-                                let bytes = to_hex(&bytes[..siz]);
-                                info!("Writing {}", bytes);
-                                write!(pty_master, "send-keys {}\n", bytes).unwrap();
-                            },
+                            Ok(siz) => tx4_clone.send((paneid, bytes, siz)),
                             Err(ref e) if e.kind() == ErrorKind::Interrupted => break,
                             Err(_) => {
                                 info!("Got an error reading from read thread");
@@ -269,20 +297,6 @@ fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<Path
                     }
                     println!("Broke out of the loop!");
                 }));
-                let rx = pane._read.take().unwrap();
-                pane.thread_write = Some(std::thread::spawn(move || {
-                    let mut write_fd_raw = Termios::new(write_fd).unwrap();
-                    write_fd_raw.set_raw_mode().unwrap();
-                    loop {
-                        match rx.recv() {
-                            Some(string) => {
-                                println!("{:?}\r", string.as_bytes());
-                                write_fd_raw.write_all(string.as_bytes()).unwrap()
-                            },
-                            None => break
-                        }
-                    }
-                }));
             }
         }
     });
@@ -290,7 +304,7 @@ fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<Path
         unsafe { libc::waitpid(pid, &mut 0, 0) };
         tx3.send(());
     });
-    return (rx1, rx2, rx3);
+    return (rx1, rx2, rx3, rx4);
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -313,6 +327,7 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn main() {
+    let signal = chan_signal::notify(&[chan_signal::Signal::WINCH]);
     let logger_config = fern::DispatchConfig {
         format: Box::new(|msg, _, _| {
             format!("{}\r", msg)
@@ -336,20 +351,27 @@ fn main() {
 
     let mut fork = Fork::from_ptmx().unwrap();
     if let Fork::Parent(pid, ref mut master) = fork {
-        let mut raw_termios = Termios::new(Fd::new(0)).unwrap();
+        let mut raw_termios = Termios::new(Fd::new(STDIN_FILENO)).unwrap();
         raw_termios.set_raw_mode().unwrap();
-        let (input, output, close) = readers(master.clone(), pid, tempsock.clone(), map.clone());
+        let (main_input, main_output, close, subwindow_input) = readers(master.clone(), pid, tempsock.clone(), map.clone());
         let mut input_mode = InputModes::LookingForTmuxDec(ipc, tempsock.clone(), map.clone());
+
+        {
+            let size = get_terminal_size(STDOUT_FILENO).unwrap();
+            set_terminal_size(master.as_raw_fd(), size).unwrap();
+            nix::sys::signal::kill(pid, Signal::SIGWINCH).unwrap();
+        }
+
         loop {
             chan_select! {
-                input.recv() -> val => {
+                main_input.recv() -> val => {
                     let (bytes, read) = match val {
                         Some((bytes, read)) => (bytes, read),
                         None => break
                     };
                     input_mode = input_mode.handle_input(&bytes[..read]);
                 },
-                output.recv() -> val => {
+                main_output.recv() -> val => {
                     let (bytes, read) = match val {
                         Some((bytes, read)) => (bytes, read),
                         None => break
@@ -364,6 +386,18 @@ fn main() {
                     } else {
                         info!("{:?}", &bytes[..read]);
                     }}
+                },
+                subwindow_input.recv() -> val => {
+                    let (paneid, bytes, read) = match val {
+                        Some(val) => val,
+                        None => break
+                    };
+                    write!(master, "send-keys -t {} {}\n", paneid, to_hex(&bytes[..read])).unwrap();
+                },
+                signal.recv() -> _ => {
+                    let size = get_terminal_size(STDOUT_FILENO).unwrap();
+                    set_terminal_size(master.as_raw_fd(), size).unwrap();
+                    nix::sys::signal::kill(pid, Signal::SIGWINCH).unwrap();
                 },
                 close.recv() -> _ => {
                     break
