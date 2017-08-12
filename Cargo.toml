@@ -14,8 +14,8 @@ log = "*"
 fern = "*"
 i3ipc = "*"
 byteorder = "*"
-nix = { git = "https://github.com/roblabla/nix", branch = "bugfix-multipleFdInCmsg" }
-nom = "*"
+nix = { git = "https://github.com/roblabla/nix", branch = "bugfix-multipleFdInCmsg", feature = ["signalfd"] }
+nom = { git = "https://github.com/roblabla/nom", branch = "feature-stdlibCompileError", features = ["nightly"] }
 tempdir = "*"
 backtrace = "*"
 unescape = "*"

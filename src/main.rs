@@ -16,13 +16,13 @@ extern crate nom;
 #[macro_use]
 extern crate nix;
 extern crate unescape;
+extern crate i3_tmux_integration;
 
 mod layout;
 mod fd;
 mod termios;
-mod termsize;
 
-use termsize::{get_terminal_size, set_terminal_size};
+use i3_tmux_integration::{get_terminal_size, set_terminal_size};
 use unescape::unescape;
 use termios::Termios;
 use fd::Fd;
@@ -124,6 +124,7 @@ impl InputModes {
                     print_tmux_msg();
                     // TODO: Make sure it creates a new workspace
                     ipc.command("workspace tmux").unwrap();
+                    // TODO: Put stdout back into normal mode
                     self = InputModes::TmuxWaiting(ipc, "tmux".into(), path, map);
                     self.handle_input(&bytes[x + TMUX_DEC.len()..])
                 },
@@ -284,7 +285,7 @@ fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<Path
                 pane._thread_read = Some(std::thread::spawn(move || {
                     let mut bytes = [0u8; 4096];
                     loop {
-                        println!("Reading !");
+                        info!("Reading !");
                         match read_fd.read(&mut bytes) {
                             Ok(0) => break,
                             Ok(siz) => tx4_clone.send((paneid, bytes, siz)),
@@ -295,7 +296,7 @@ fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<Path
                             }
                         };
                     }
-                    println!("Broke out of the loop!");
+                    info!("Broke out of the loop!");
                 }));
             }
         }
@@ -328,14 +329,10 @@ fn to_hex(bytes: &[u8]) -> String {
 
 fn main() {
     let signal = chan_signal::notify(&[chan_signal::Signal::WINCH]);
-    let logger_config = fern::DispatchConfig {
-        format: Box::new(|msg, _, _| {
-            format!("{}\r", msg)
-        }),
-        output: vec![fern::OutputConfig::stdout()],
-        level: log::LogLevelFilter::Trace
-    };
-    fern::init_global_logger(logger_config, log::LogLevelFilter::Trace).unwrap();
+    fern::Dispatch::new()
+        .level(log::LogLevelFilter::Trace)
+        .chain(fern::log_file("output.log").unwrap())
+        .apply().unwrap();
 
     let tempdir = tempdir::TempDir::new("i3-tmux").unwrap();
     let tempsock = Arc::new(tempdir.path().join("server.sock"));
@@ -359,7 +356,7 @@ fn main() {
         {
             let size = get_terminal_size(STDOUT_FILENO).unwrap();
             set_terminal_size(master.as_raw_fd(), size).unwrap();
-            nix::sys::signal::kill(pid, Signal::SIGWINCH).unwrap();
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), Signal::SIGWINCH).unwrap();
         }
 
         loop {
@@ -397,7 +394,7 @@ fn main() {
                 signal.recv() -> _ => {
                     let size = get_terminal_size(STDOUT_FILENO).unwrap();
                     set_terminal_size(master.as_raw_fd(), size).unwrap();
-                    nix::sys::signal::kill(pid, Signal::SIGWINCH).unwrap();
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), Signal::SIGWINCH).unwrap();
                 },
                 close.recv() -> _ => {
                     break

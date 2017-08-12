@@ -19,7 +19,7 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn parse(layout_bytes: &str) -> Result<Layout, nom::Err<&str>> {
+    pub fn parse(layout_bytes: &str) -> Result<Layout, nom::Err> {
         match layout(layout_bytes) {
             Done(rest, lay) => Ok(lay),
             Error(err) => Err(err),
@@ -37,51 +37,29 @@ named!(u64_digit<&str, u64>,
 
 named!(container<&str, Container>,
     alt!(
-        chain!(
-            tag_s!("{") ~
-            layout1: layout ~
-            mut layout_rest: many1!(chain!(
-                tag_s!(",") ~
-                layout: layout,
-                || { layout })) ~
-            tag_s!("}"),
-            ||{layout_rest.push(layout1); Container::LeftRightLayout(layout_rest)}
-        ) => { |layout| layout }
-      | chain!(
-            tag_s!("[") ~
-            layout1: layout ~
-            mut layout_rest: many1!(chain!(
-                tag_s!(",") ~
-                layout: layout,
-                || { layout })) ~
-            tag_s!("]"),
-            ||{layout_rest.push(layout1); Container::TopDownLayout(layout_rest)}
-        ) => { |layout| layout }
-      | chain!(
-          tag_s!(",") ~
-          paneid: u64_digit,
-          || Container::Pane(paneid)
-        ) => { |layout| layout }
+        delimited!(tag_s!("{"), separated_nonempty_list_complete!(tag_s!(","), layout), tag_s!("}")) => { |l| Container::LeftRightLayout(l) } |
+        delimited!(tag_s!("["), separated_nonempty_list_complete!(tag_s!(","), layout), tag_s!("]")) => { |l| Container::TopDownLayout(l) } |
+        preceded!(tag_s!(","), u64_digit) => { |paneid| Container::Pane(paneid) }
     )
 );
 
 named!(layout<&str, Layout>,
-    chain!(
-        width: u64_digit ~
-        tag_s!("x") ~
-        height: u64_digit ~
-        tag_s!(",") ~
-        xoff: u64_digit ~
-        tag_s!(",") ~
-        yoff: u64_digit ~
-        container: container,
-        || { Layout {
+    do_parse!(
+        width: u64_digit >>
+        tag_s!("x") >>
+        height: u64_digit >>
+        tag_s!(",") >>
+        xoff: u64_digit >>
+        tag_s!(",") >>
+        yoff: u64_digit >>
+        container: container >>
+        (Layout {
             width: width,
             height: height,
             xoff: xoff,
             yoff: yoff,
             contains: container
-        }}
+        })
     )
 );
 
