@@ -4,5 +4,9 @@
 extern crate libc;
 #[macro_use]
 extern crate nix;
+extern crate mio;
+
 mod termsize;
+mod fd;
 pub use termsize::*;
+pub use fd::*;

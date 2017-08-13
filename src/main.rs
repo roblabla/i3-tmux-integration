@@ -3,9 +3,6 @@ extern crate libc;
 extern crate termios as raw_termios;
 extern crate tempdir;
 extern crate twoway;
-#[macro_use(chan_select)]
-extern crate chan;
-extern crate chan_signal;
 #[macro_use]
 extern crate log;
 extern crate fern;
@@ -13,32 +10,33 @@ extern crate i3ipc;
 extern crate byteorder;
 #[macro_use]
 extern crate nom;
-#[macro_use]
 extern crate nix;
 extern crate unescape;
 extern crate i3_tmux_integration;
+extern crate mio;
+extern crate mio_uds;
+#[macro_use]
+extern crate error_chain;
 
 mod layout;
-mod fd;
 mod termios;
+mod error;
 
+use mio::*;
+use mio::unix::EventedFd;
 use i3_tmux_integration::{get_terminal_size, set_terminal_size};
 use unescape::unescape;
 use termios::Termios;
-use fd::Fd;
-use std::os::unix::net::UnixDatagram;
+use i3_tmux_integration::Fd;
+use mio_uds::UnixDatagram;
 use std::os::unix::io::AsRawFd;
 use std::collections::HashMap;
 use i3ipc::I3Connection;
 use std::env;
-use std::path::{PathBuf, Path};
+use std::path::Path;
 use std::ptr;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::io::{self, Read, Write, Cursor, ErrorKind};
-use std::os::unix::thread::JoinHandleExt;
+use std::io::{self, Read, Write, Cursor};
 use std::ffi::{CString, CStr};
-use std::thread;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::RawFd;
 use pty::fork::*;
@@ -46,31 +44,33 @@ use libc::{STDIN_FILENO, STDOUT_FILENO};
 use nix::sys::socket::{recvmsg, MsgFlags, CmsgSpace, ControlMessage};
 use nix::sys::signal::Signal;
 use nix::sys::uio::{IoVec};
+use nix::unistd::Pid;
 use byteorder::{ReadBytesExt, NativeEndian};
 
 const TMUX_DEC : [u8; 7]= [0o33, 'P' as u8, '1' as u8, '0' as u8, '0' as u8, '0' as u8, 'p' as u8];
 
-// TODO: Figure out how to create an Arc<Path>
-enum InputModes {
-    LookingForTmuxDec(I3Connection, Arc<PathBuf>, Arc<Mutex<HashMap<u64, Pane>>>),
-    TmuxWaiting(I3Connection, String, Arc<PathBuf>, Arc<Mutex<HashMap<u64, Pane>>>),
-    TmuxCommandBlock(I3Connection, String, Arc<PathBuf>, Arc<Mutex<HashMap<u64, Pane>>>)
+enum InputModes<'a> {
+    LookingForTmuxDec(I3Connection, &'a Path),
+    TmuxWaiting(I3Connection, String, &'a Path),
+    TmuxCommandBlock(I3Connection, String, &'a Path)
 }
 
 struct Pane {
     id: u64,
     x11win: Option<u64>,
-    signal_fd: Option<fd::Fd>,
     // Need to store the rx side until the thread is created when we
     // receive stuff on the unix socket...
     _to_write: Vec<Vec<u8>>,
-    _thread_read: Option<std::thread::JoinHandle<()>>,
-    write: Option<termios::Termios<fd::Fd>>
+    read_fd: Option<Fd>,
+    size_fd: Option<Fd>,
+    write_fd: Option<termios::Termios<Fd>>
 }
+
+// TODO: Impl Read for Pane
 
 impl Write for Pane {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Some(ref mut fd) = self.write {
+        if let Some(ref mut fd) = self.write_fd {
             fd.write(buf)
         } else {
             self._to_write.push(buf.into());
@@ -79,7 +79,7 @@ impl Write for Pane {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if let Some(ref mut fd) = self.write {
+        if let Some(ref mut fd) = self.write_fd {
             fd.flush()
         } else {
             Ok(())
@@ -87,18 +87,8 @@ impl Write for Pane {
     }
 }
 
-impl Drop for Pane {
-    fn drop(&mut self) {
-        // Make sure everything gets closed.
-        if let Some(thread) = self._thread_read.take() {
-            unsafe { libc::pthread_kill(thread.as_pthread_t(), libc::SIGINT); }
-            thread.join().unwrap();
-        }
-    }
-}
-
 impl Pane {
-    pub fn new(id: u64, path: &PathBuf, ipc: &mut I3Connection) -> Pane {
+    pub fn new(id: u64, path: &Path, ipc: &mut I3Connection) -> Pane {
         // Start the terminal on creation.
         let mut exepath = std::env::current_exe().unwrap();
         exepath.set_file_name("tmux-integration-window");
@@ -107,34 +97,34 @@ impl Pane {
         Pane {
             id: id,
             x11win: None,
-            signal_fd: None,
             _to_write: vec![],
-            _thread_read: None,
-            write: None
+            read_fd: None,
+            size_fd: None,
+            write_fd: None
         }
     }
 }
 
-impl InputModes {
-    fn handle_input(mut self, bytes: &[u8]) -> Self {
+impl<'a> InputModes<'a> {
+    fn handle_input(mut self, bytes: &[u8], panes: &mut HashMap<u64, Pane>) -> Self {
         match self {
-            InputModes::LookingForTmuxDec(mut ipc, path, map) => match twoway::find_bytes(bytes, &TMUX_DEC) {
+            InputModes::LookingForTmuxDec(mut ipc, path) => match twoway::find_bytes(bytes, &TMUX_DEC) {
                 Some(x) => {
                     std::io::stdout().write(&bytes[..x]).unwrap();
                     print_tmux_msg();
                     // TODO: Make sure it creates a new workspace
                     ipc.command("workspace tmux").unwrap();
                     // TODO: Put stdout back into normal mode
-                    self = InputModes::TmuxWaiting(ipc, "tmux".into(), path, map);
-                    self.handle_input(&bytes[x + TMUX_DEC.len()..])
+                    self = InputModes::TmuxWaiting(ipc, "tmux".into(), path);
+                    self.handle_input(&bytes[x + TMUX_DEC.len()..], panes)
                 },
                 None => {
                     std::io::stdout().write(bytes).unwrap();
                     std::io::stdout().flush().unwrap();
-                    InputModes::LookingForTmuxDec(ipc, path, map)
+                    InputModes::LookingForTmuxDec(ipc, path)
                 }
             },
-            InputModes::TmuxWaiting(mut ipc, workspace, path, panes) => {
+            InputModes::TmuxWaiting(mut ipc, workspace, path) => {
                 let mut size = 0usize;
                 for mut line in bytes.split(|&e| e == '\n' as u8) {
                     size += line.len() + 1;
@@ -150,14 +140,13 @@ impl InputModes {
                     let args : Vec<&str> = iter.collect();
                     info!("Command : '{}' {:?}", cmd, args);
                     match cmd {
-                        "%begin" => (),
+                        "%begin" => {
+                            ()//self = InputModes::TmuxCommandBlock(ipc, workspace, path);
+                        },
                         "%exit" => {
-                            {
-                                let mut lock = panes.lock().unwrap();
-                                lock.clear();
-                            }
-                            self = InputModes::LookingForTmuxDec(ipc, path, panes);
-                            return self.handle_input(&bytes[size..]);
+                            panes.clear();
+                            self = InputModes::LookingForTmuxDec(ipc, path);
+                            return self.handle_input(&bytes[size..], panes);
                         },
                         "%layout-change" => {
                             let windowid = args[0][1..].parse::<u64>();
@@ -168,24 +157,20 @@ impl InputModes {
                         },
                         "%output" => {
                             let paneid = args[0][1..].parse::<u64>().unwrap();
-                            let mut lock = panes.lock().unwrap();
-                            let pane = lock.entry(paneid).or_insert_with(|| Pane::new(paneid, &*path, &mut ipc));
+                            let pane = panes.entry(paneid).or_insert_with(|| Pane::new(paneid, path, &mut ipc));
                             pane.write(&args[2..].iter().fold(unescape(args[1]).unwrap(), |mut acc, &x| {
                                 acc.push_str(" ");
                                 acc.push_str(&unescape(x).unwrap());
                                 acc
-                            }).into_bytes()[..]);
+                            }).into_bytes()[..]).unwrap();
                         },
                         "%session-changed" => (),
                         "%session-renamed" => (),
                         "%sessions-changed" => (),
                         "%unlinked-window-add" => (),
-                        "%window-add" => (),/*{
+                        "%window-add" => {
                             let windowid = args[0];
-                            let mut path = tempdir.join("socket");
-
-                            //ipc.command(format!("workspace tmux; exec urxvt -e 'tmux-integration-window {}; workspace back_and_forth'", path.display())).unwrap();
-                        },*/
+                        },
                         "%window-close" => (),
                         "%window-renamed" => (),
                         cmd => {
@@ -193,10 +178,17 @@ impl InputModes {
                         }
                     }
                 }
-                InputModes::TmuxWaiting(ipc, workspace, path, panes)
+                InputModes::TmuxWaiting(ipc, workspace, path)
             },
             InputModes::TmuxCommandBlock(..) => {
                 self
+                /*let mut size = 0usize;
+                for mut lines in bytes.split(|&e| e == '\n' as u8) {
+                    size += line.len() + 1;
+                    if line.len() > 0 && line[line.len() - 1] == b'\r' {
+                        line = &line[..line.len() - 1];
+                    }
+                }*/
             }
         }
     }
@@ -210,102 +202,6 @@ fn print_tmux_msg() {
     println!("  X    Force-quit tmux mode.\r");
     println!("  L    Toggle logging.\r");
     println!("  C    Run tmux command.\r");
-}
-
-// TODO: Figure out safe, correct way to send a slice via chan.
-fn readers<'a, 'b>(mut pty_master : Master, pid: libc::pid_t, tempsock: Arc<PathBuf>, panes: Arc<Mutex<HashMap<u64, Pane>>>) -> (chan::Receiver<([u8;4096], usize)>, chan::Receiver<([u8;4096], usize)>, chan::Receiver<()>, chan::Receiver<(u64, [u8;4096], usize)>) {
-    let (tx1, rx1) = chan::sync(0); // TODO: might want to make this a sync channel instead of rdv
-    let (tx2, rx2) = chan::sync(0);
-    let (tx3, rx3) = chan::sync(0);
-    let (tx4, rx4) = chan::sync(0);
-    thread::spawn(move || {
-        let mut bytes = [0u8; 4096];
-        loop {
-            let read = match pty_master.read(&mut bytes) {
-                Ok(0) => break,
-                Ok(read) => read,
-                Err(_) => {
-                    info!("Got an error reading from stdin");
-                    break
-                }
-            };
-            tx1.send((bytes, read));
-        }
-    });
-    thread::spawn(move || {
-        let mut bytes = [0u8; 4096];
-        loop {
-            let read = match io::stdin().read(&mut bytes) {
-                Ok(0) => break,
-                Ok(read) => read,
-                Err(_) => {
-                    info!("Got an error reading from stdout");
-                    break
-                }
-            };
-            tx2.send((bytes, read));
-        }
-    });
-    thread::spawn(move || {
-        let mut buf = [0u8; 8];
-        let datagram = UnixDatagram::bind(&*tempsock).unwrap();
-        loop {
-            let iovec = [IoVec::from_mut_slice(&mut buf)];
-            let mut space = CmsgSpace::<[RawFd; 2]>::new();
-            let (paneid, fds) = match recvmsg(datagram.as_raw_fd(), &iovec, Some(&mut space), MsgFlags::empty()) {
-                Ok(msg) => {
-                    if let Some(ControlMessage::ScmRights(fds)) = msg.cmsgs().next() {
-                        (Cursor::new(iovec[0].as_slice()).read_u64::<NativeEndian>().unwrap(), fds.to_vec())
-                    } else {
-                        info!("Got an error reading from unix socket");
-                        break
-                    }
-                },
-                Err(nix::Error::Sys(nix::Errno::EINTR)) => {
-                    break
-                }
-                Err(_) => {
-                    info!("Got an error reading from unix socket");
-                    break
-                }
-            };
-            let mut lock = panes.lock().unwrap();
-            if let Some(pane) = lock.get_mut(&paneid) {
-                let mut raw_fd = Termios::new(Fd::new(fds[1])).unwrap();
-                raw_fd.set_raw_mode().unwrap();
-                pane.write = Some(raw_fd);
-                let mut _to_write = vec![];
-                std::mem::swap(&mut _to_write, &mut pane._to_write);
-                for bytes in _to_write.iter() {
-                    pane.write(bytes);
-                }
-                pane._to_write = vec![];
-                let mut read_fd = Fd::new(fds[0]);
-                let tx4_clone = tx4.clone();
-                pane._thread_read = Some(std::thread::spawn(move || {
-                    let mut bytes = [0u8; 4096];
-                    loop {
-                        info!("Reading !");
-                        match read_fd.read(&mut bytes) {
-                            Ok(0) => break,
-                            Ok(siz) => tx4_clone.send((paneid, bytes, siz)),
-                            Err(ref e) if e.kind() == ErrorKind::Interrupted => break,
-                            Err(_) => {
-                                info!("Got an error reading from read thread");
-                                break
-                            }
-                        };
-                    }
-                    info!("Broke out of the loop!");
-                }));
-            }
-        }
-    });
-    thread::spawn(move || {
-        unsafe { libc::waitpid(pid, &mut 0, 0) };
-        tx3.send(());
-    });
-    return (rx1, rx2, rx3, rx4);
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -327,81 +223,170 @@ fn to_hex(bytes: &[u8]) -> String {
     mystr
 }
 
+// Macro that calls `continue` on nonblock error
+macro_rules! try_cont {
+    ($e:expr) => (match $e {
+        Ok(v) => v,
+        Err(ref e) if e.kind() == ::std::io::ErrorKind::WouldBlock => continue,
+        Err(e) => return Err(From::from(e))
+    })
+}
+
+const SUBWINDOW_INPUT_PANEID_MOD : usize = 1;
+const SUBWINDOW_SIZE_PANEID_MOD : usize = 0;
+const FD_PER_PANEID : usize = 2;
+const MAIN_STDIN : Token = Token(0);
+const MAIN_STDOUT : Token = Token(1);
+const SUBWINDOW_SOCKET : Token = Token(2);
+const FIRST_PANEID : usize = 3;
+
+fn token_to_pane(t: usize) -> usize {
+    assert!(t >= FIRST_PANEID);
+    (t - FIRST_PANEID) / FD_PER_PANEID
+}
+
+fn token_is_subwindow_input(t: usize) -> bool {
+    t >= FIRST_PANEID && t % FD_PER_PANEID == SUBWINDOW_INPUT_PANEID_MOD
+}
+
+fn token_is_subwindow_size(t: usize) -> bool {
+    t >= FIRST_PANEID && t % FD_PER_PANEID == SUBWINDOW_SIZE_PANEID_MOD
+}
+
+fn main_window_loop(shell_pid: Pid, master: &mut pty::fork::Master) -> error::Result<libc::c_void> {
+    // Create the Unix Datagram socket that will allow the tmux subwindow to
+    // send the stdin/stdout/termsize FD
+    let tempdir = tempdir::TempDir::new("i3-tmux")?;
+    let subwindow_creation_sockpath = tempdir.path().join("server.sock");
+    let subwindow_creation_socket = UnixDatagram::bind(&*subwindow_creation_sockpath)?;
+
+    // Create the map of Pane
+    let mut panes : HashMap<u64, Pane> = HashMap::new();
+
+    // Connect to the I3 IPC
+    let ipc = I3Connection::connect()?;
+
+    // Create our Mio Event loop
+    let poll = Poll::new()?;
+
+    // put stdin in Raw Mode so we can act as a proxy between the terminal and
+    // the shell.
+    let mut raw_termios = Termios::new(Fd::new(STDIN_FILENO))?;
+    raw_termios.set_raw_mode()?;
+
+    // Initialize the tmux parser state
+    let mut input_mode = InputModes::LookingForTmuxDec(ipc, &subwindow_creation_sockpath);
+
+    // Resize the shell
+    {
+        let size = get_terminal_size(STDOUT_FILENO)?;
+        set_terminal_size(master.as_raw_fd(), size)?;
+        nix::sys::signal::kill(shell_pid, Signal::SIGWINCH)?;
+    }
+
+    // Initialize various variables
+    let mut buf = [0u8; 4096];
+    let mut events = Events::with_capacity(1024);
+
+    // Register the "main" things.
+    poll.register(&EventedFd(&master.as_raw_fd()), MAIN_STDIN, Ready::readable(), PollOpt::level())?;
+    poll.register(&EventedFd(&STDIN_FILENO), MAIN_STDOUT, Ready::readable(), PollOpt::level())?;
+    poll.register(&subwindow_creation_socket, SUBWINDOW_SOCKET, Ready::readable(), PollOpt::level())?;
+
+    loop {
+        // Check for new events
+        poll.poll(&mut events, None)?;
+        for event in events.iter() {
+            match event.token() {
+                // User typed data on the main window
+                MAIN_STDIN => {
+                    let read = match try_cont!(master.read(&mut buf)) {
+                        0 => /* TODO: bash was closed */(),
+                        read => input_mode = input_mode.handle_input(&buf[..read], &mut panes),
+                    };
+                },
+                // The main window's shell printed data
+                MAIN_STDOUT => {
+                    let read = try_cont!(io::stdin().read(&mut buf));
+                    if let InputModes::LookingForTmuxDec(..) = input_mode {
+                        master.write(&buf[..read])?;
+                        master.flush()?;
+                    } else { if buf.iter().find(|e| **e == 27).is_some() {
+                        info!("Detaching");
+                        master.write("detach\n".as_ref())?;
+                        master.flush()?;
+                    } else {
+                        info!("{:?}", &buf[..read]);
+                    }}
+                },
+                // A new subwindow was created, it sent its fds to our socket
+                SUBWINDOW_SOCKET => {
+                    // Get the pane id and file descriptors
+                    let iovec = [IoVec::from_mut_slice(&mut buf)];
+                    let mut space = CmsgSpace::<[RawFd; 3]>::new();
+                    let msg = match recvmsg(subwindow_creation_socket.as_raw_fd(), &iovec, Some(&mut space), MsgFlags::empty()) {
+                        Ok(v) => v,
+                        Err(nix::Error::Sys(nix::Errno::EAGAIN)) => continue,
+                        Err(err) => return Err(From::from(err))
+                    };
+                    let (paneid, fds) = if let Some(ControlMessage::ScmRights(fds)) = msg.cmsgs().next() {
+                        (Cursor::new(iovec[0].as_slice()).read_u64::<NativeEndian>()?, fds.to_vec())
+                    } else {
+                        // TODO: Error it
+                        panic!("Got an error reading from unix socket");
+                        //break
+                    };
+
+                    // Try to find which Pane is this paneid
+                    if let Some(pane) = panes.get_mut(&paneid) {
+                        // Write this pane's pending data, set the read/write
+                        // FDs, and register the new panel to the event loop
+                        let mut raw_fd = Termios::new(Fd::new(fds[1])).unwrap();
+                        raw_fd.set_raw_mode().unwrap();
+                        pane.write_fd = Some(raw_fd);
+                        let bytesvec = std::mem::replace(&mut pane._to_write, vec![]);
+                        for bytes in bytesvec {
+                            pane.write_all(&bytes).unwrap();
+                        }
+                        let fd = Fd::new(fds[0]);
+                        poll.register(&fd, Token(((paneid as usize * FD_PER_PANEID) + 0) + FIRST_PANEID), Ready::readable(), PollOpt::level())?;
+                        // Set nonblock ?
+                        pane.read_fd = Some(fd);
+                    } else {
+                        panic!("WTF?");
+                    }
+                },
+                // A subwindow's shell printed data
+                Token(i) if token_is_subwindow_input(i) => {
+                    let paneid = token_to_pane(i);
+                    // TODO: How to handle panics ?
+                    let read_fd = panes.get_mut(&(paneid as u64)).unwrap().read_fd.as_mut().unwrap();
+                    let read = try_cont!(read_fd.read(&mut buf));
+                    write!(master, "send-keys -t {} {}\n", paneid, to_hex(&buf[..read]))?;
+                },
+                // A subwindow's size changed
+                Token(i) if token_is_subwindow_size(i) => {
+                    let paneid = token_to_pane(i);
+                    println!("Got data from {} in subwindow_size", paneid);
+                },
+                _ => panic!("WTF?")
+            }
+        }
+    }
+}
+
 fn main() {
-    let signal = chan_signal::notify(&[chan_signal::Signal::WINCH]);
+    // Setup the logger
     fern::Dispatch::new()
         .level(log::LogLevelFilter::Trace)
         .chain(fern::log_file("output.log").unwrap())
         .apply().unwrap();
 
-    let tempdir = tempdir::TempDir::new("i3-tmux").unwrap();
-    let tempsock = Arc::new(tempdir.path().join("server.sock"));
-    let map = Arc::new(Mutex::new(HashMap::new()));
-
-    let ipc = match I3Connection::connect() {
-        Ok(ipc) => ipc,
-        Err(err) => {
-            write!(std::io::stderr(), "Error connecting to i3 IPC! {}\n", err).unwrap();
-            return;
-        }
-    };
-
     let mut fork = Fork::from_ptmx().unwrap();
     if let Fork::Parent(pid, ref mut master) = fork {
-        let mut raw_termios = Termios::new(Fd::new(STDIN_FILENO)).unwrap();
-        raw_termios.set_raw_mode().unwrap();
-        let (main_input, main_output, close, subwindow_input) = readers(master.clone(), pid, tempsock.clone(), map.clone());
-        let mut input_mode = InputModes::LookingForTmuxDec(ipc, tempsock.clone(), map.clone());
-
-        {
-            let size = get_terminal_size(STDOUT_FILENO).unwrap();
-            set_terminal_size(master.as_raw_fd(), size).unwrap();
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), Signal::SIGWINCH).unwrap();
-        }
-
-        loop {
-            chan_select! {
-                main_input.recv() -> val => {
-                    let (bytes, read) = match val {
-                        Some((bytes, read)) => (bytes, read),
-                        None => break
-                    };
-                    input_mode = input_mode.handle_input(&bytes[..read]);
-                },
-                main_output.recv() -> val => {
-                    let (bytes, read) = match val {
-                        Some((bytes, read)) => (bytes, read),
-                        None => break
-                    };
-                    if let InputModes::LookingForTmuxDec(..) = input_mode {
-                        master.write(&bytes[..read]).unwrap();
-                        master.flush().unwrap();
-                    } else { if bytes.iter().find(|e| **e == 27).is_some() {
-                        info!("Detaching");
-                        master.write("detach\n".as_ref()).unwrap();
-                        master.flush().unwrap();
-                    } else {
-                        info!("{:?}", &bytes[..read]);
-                    }}
-                },
-                subwindow_input.recv() -> val => {
-                    let (paneid, bytes, read) = match val {
-                        Some(val) => val,
-                        None => break
-                    };
-                    write!(master, "send-keys -t {} {}\n", paneid, to_hex(&bytes[..read])).unwrap();
-                },
-                signal.recv() -> _ => {
-                    let size = get_terminal_size(STDOUT_FILENO).unwrap();
-                    set_terminal_size(master.as_raw_fd(), size).unwrap();
-                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), Signal::SIGWINCH).unwrap();
-                },
-                close.recv() -> _ => {
-                    break
-                },
-            }
-        }
+        main_window_loop(Pid::from_raw(pid), master).unwrap();
     } else {
+        // Start the user's shell.
         let hold_cstring : CString;
         let cmd = unsafe {
             if let Some(str) = env::args_os().nth(1) {
