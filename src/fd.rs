@@ -9,6 +9,7 @@ use mio::unix::EventedFd;
 pub struct Fd(RawFd);
 
 impl Fd {
+    // TODO: Mark unsafe
     pub fn new(fd: RawFd) -> Fd {
         Fd(fd)
     }
@@ -46,7 +47,7 @@ impl Write for Fd {
 
 impl Drop for Fd {
     fn drop(&mut self) {
-        // TODO: Close self.0
+        unsafe { libc::close(self.0) };
     }
 }
 
