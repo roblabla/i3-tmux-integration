@@ -26,13 +26,14 @@ fn main() {
     // Create the signalfd fd.
     let mut signals = SigSet::empty();
     signals.add(Signal::SIGWINCH);
+    signals.thread_block();
     let mut signalfd = SignalFd::new(&signals).unwrap();
 
     // It turns out signalfd works in a strange way when the fd is passed to
     // another process. When the receiving process reads from that fd, it will
     // get its own signal, not the signalfd's creator's. So what we'll do is
     // create a pipe and send the new size through it.
-    let (write, read) = nix::unistd::pipe().unwrap();
+    let (read, write) = nix::unistd::pipe().unwrap();
     let mut writefile = unsafe { Fd::new(write) };
 
     // Write the paneid in the packet to send to the i3-tmux-integration service.

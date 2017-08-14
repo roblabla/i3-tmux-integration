@@ -40,9 +40,10 @@ use std::ffi::{CString, CStr};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::io::RawFd;
 use pty::fork::*;
-use libc::{STDIN_FILENO, STDOUT_FILENO};
+use libc::{winsize, STDIN_FILENO, STDOUT_FILENO};
 use nix::sys::socket::{recvmsg, MsgFlags, CmsgSpace, ControlMessage};
-use nix::sys::signal::Signal;
+use nix::sys::signal::{SigSet, Signal};
+use nix::sys::signalfd::SignalFd;
 use nix::sys::uio::{IoVec};
 use nix::unistd::Pid;
 use byteorder::{ReadBytesExt, NativeEndian};
@@ -55,7 +56,7 @@ enum InputModes<'a> {
     TmuxCommandBlock(I3Connection, String, &'a Path)
 }
 
-struct Pane {
+struct Pane<'a> {
     id: u64,
     x11win: Option<u64>,
     // Need to store the rx side until the thread is created when we
@@ -63,12 +64,13 @@ struct Pane {
     _to_write: Vec<Vec<u8>>,
     read_fd: Option<Fd>,
     size_fd: Option<Fd>,
-    write_fd: Option<termios::Termios<Fd>>
+    write_fd: Option<termios::Termios<Fd>>,
+    poll: Option<&'a Poll>
 }
 
 // TODO: Impl Read for Pane
 
-impl Write for Pane {
+impl<'a> Write for Pane<'a> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if let Some(ref mut fd) = self.write_fd {
             fd.write(buf)
@@ -87,8 +89,8 @@ impl Write for Pane {
     }
 }
 
-impl Pane {
-    pub fn new(id: u64, path: &Path, ipc: &mut I3Connection) -> Pane {
+impl<'a> Pane<'a> {
+    pub fn new(id: u64, path: &Path, ipc: &mut I3Connection) -> Pane<'a> {
         // Start the terminal on creation.
         let mut exepath = std::env::current_exe().unwrap();
         exepath.set_file_name("tmux-integration-window");
@@ -100,7 +102,17 @@ impl Pane {
             _to_write: vec![],
             read_fd: None,
             size_fd: None,
-            write_fd: None
+            write_fd: None,
+            poll: None
+        }
+    }
+}
+
+impl<'a> Drop for Pane<'a> {
+    fn drop(&mut self) {
+        if let (Some(poll), Some(read_fd), Some(size_fd)) = (self.poll.take(), self.read_fd.take(), self.size_fd.take())  {
+            poll.deregister(&EventedFd(&read_fd.as_raw_fd())).unwrap();
+            poll.deregister(&EventedFd(&size_fd.as_raw_fd())).unwrap();
         }
     }
 }
@@ -114,6 +126,7 @@ impl<'a> InputModes<'a> {
                     print_tmux_msg();
                     // TODO: Make sure it creates a new workspace
                     ipc.command("workspace tmux").unwrap();
+                    // TODO: Set the client size
                     // TODO: Put stdout back into normal mode
                     self = InputModes::TmuxWaiting(ipc, "tmux".into(), path);
                     self.handle_input(&bytes[x + TMUX_DEC.len()..], panes)
@@ -204,6 +217,13 @@ fn print_tmux_msg() {
     println!("  C    Run tmux command.\r");
 }
 
+macro_rules! tmux_cmd {
+    ($dst: expr, $($arg: tt)*) => {{
+        info!("Sending cmd: {}", format!($($arg)*));
+        writeln!($dst, $($arg)*)
+    }}
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     let mut mystr = String::with_capacity(bytes.len() * 5);
     for byte in bytes {
@@ -232,13 +252,14 @@ macro_rules! try_cont {
     })
 }
 
-const SUBWINDOW_INPUT_PANEID_MOD : usize = 1;
-const SUBWINDOW_SIZE_PANEID_MOD : usize = 0;
+const SUBWINDOW_INPUT_PANEID_MOD : usize = 0;
+const SUBWINDOW_SIZE_PANEID_MOD : usize = 1;
 const FD_PER_PANEID : usize = 2;
 const MAIN_STDIN : Token = Token(0);
 const MAIN_STDOUT : Token = Token(1);
-const SUBWINDOW_SOCKET : Token = Token(2);
-const FIRST_PANEID : usize = 3;
+const MAIN_SIGFD : Token = Token(2);
+const SUBWINDOW_SOCKET : Token = Token(3);
+const FIRST_PANEID : usize = 4;
 
 fn token_to_pane(t: usize) -> usize {
     assert!(t >= FIRST_PANEID);
@@ -260,14 +281,14 @@ fn main_window_loop(shell_pid: Pid, master: &mut pty::fork::Master) -> error::Re
     let subwindow_creation_sockpath = tempdir.path().join("server.sock");
     let subwindow_creation_socket = UnixDatagram::bind(&*subwindow_creation_sockpath)?;
 
-    // Create the map of Pane
-    let mut panes : HashMap<u64, Pane> = HashMap::new();
-
     // Connect to the I3 IPC
     let ipc = I3Connection::connect()?;
 
     // Create our Mio Event loop
     let poll = Poll::new()?;
+
+    // Create the map of Pane
+    let mut panes : HashMap<u64, Pane> = HashMap::new();
 
     // put stdin in Raw Mode so we can act as a proxy between the terminal and
     // the shell.
@@ -278,11 +299,10 @@ fn main_window_loop(shell_pid: Pid, master: &mut pty::fork::Master) -> error::Re
     let mut input_mode = InputModes::LookingForTmuxDec(ipc, &subwindow_creation_sockpath);
 
     // Resize the shell
-    {
-        let size = get_terminal_size(STDOUT_FILENO)?;
-        set_terminal_size(master.as_raw_fd(), size)?;
-        nix::sys::signal::kill(shell_pid, Signal::SIGWINCH)?;
-    }
+    let mut main_window_signals = SigSet::empty();
+    main_window_signals.add(Signal::SIGWINCH);
+    main_window_signals.thread_block()?;
+    let mut signalfd = SignalFd::with_flags(&main_window_signals, nix::sys::signalfd::SFD_NONBLOCK).unwrap();
 
     // Initialize various variables
     let mut buf = [0u8; 4096];
@@ -291,7 +311,16 @@ fn main_window_loop(shell_pid: Pid, master: &mut pty::fork::Master) -> error::Re
     // Register the "main" things.
     poll.register(&EventedFd(&master.as_raw_fd()), MAIN_STDIN, Ready::readable(), PollOpt::level())?;
     poll.register(&EventedFd(&STDIN_FILENO), MAIN_STDOUT, Ready::readable(), PollOpt::level())?;
+    poll.register(&EventedFd(&signalfd.as_raw_fd()), MAIN_SIGFD, Ready::readable(), PollOpt::level())?;
     poll.register(&subwindow_creation_socket, SUBWINDOW_SOCKET, Ready::readable(), PollOpt::level())?;
+
+    // Set the initial size of the subshell. We don't go fast enough to get the
+    // first sigwinch
+    {
+        let size = get_terminal_size(STDIN_FILENO)?;
+        set_terminal_size(master.as_raw_fd(), size)?;
+        nix::sys::signal::kill(shell_pid, Signal::SIGWINCH)?;
+    }
 
     loop {
         // Check for new events
@@ -318,6 +347,14 @@ fn main_window_loop(shell_pid: Pid, master: &mut pty::fork::Master) -> error::Re
                     } else {
                         info!("{:?}", &buf[..read]);
                     }}
+                },
+                // The main window's size has changed
+                MAIN_SIGFD => {
+                    if let Some(_) = signalfd.read_signal()? {
+                        let size = get_terminal_size(STDIN_FILENO)?;
+                        set_terminal_size(master.as_raw_fd(), size)?;
+                        nix::sys::signal::kill(shell_pid, Signal::SIGWINCH)?;
+                    }
                 },
                 // A new subwindow was created, it sent its fds to our socket
                 SUBWINDOW_SOCKET => {
@@ -348,10 +385,18 @@ fn main_window_loop(shell_pid: Pid, master: &mut pty::fork::Master) -> error::Re
                         for bytes in bytesvec {
                             pane.write_all(&bytes).unwrap();
                         }
-                        let fd = Fd::new(fds[0]);
-                        poll.register(&fd, Token(((paneid as usize * FD_PER_PANEID) + 0) + FIRST_PANEID), Ready::readable(), PollOpt::level())?;
-                        // Set nonblock ?
-                        pane.read_fd = Some(fd);
+                        pane.poll = Some(&poll);
+                        {
+                            let fd = Fd::new(fds[0]);
+                            // Set nonblock ?
+                            poll.register(&fd, Token(((paneid as usize * FD_PER_PANEID) + 0) + FIRST_PANEID), Ready::readable(), PollOpt::level())?;
+                            pane.read_fd = Some(fd);
+                        }
+                        {
+                            let fd = Fd::new(fds[2]);
+                            poll.register(&fd, Token(((paneid as usize * FD_PER_PANEID) + 1) + FIRST_PANEID), Ready::readable(), PollOpt::level())?;
+                            pane.size_fd = Some(fd);
+                        }
                     } else {
                         panic!("WTF?");
                     }
@@ -360,14 +405,41 @@ fn main_window_loop(shell_pid: Pid, master: &mut pty::fork::Master) -> error::Re
                 Token(i) if token_is_subwindow_input(i) => {
                     let paneid = token_to_pane(i);
                     // TODO: How to handle panics ?
-                    let read_fd = panes.get_mut(&(paneid as u64)).unwrap().read_fd.as_mut().unwrap();
-                    let read = try_cont!(read_fd.read(&mut buf));
-                    write!(master, "send-keys -t {} {}\n", paneid, to_hex(&buf[..read]))?;
+                    if let Some(ref mut pane) = panes.get_mut(&(paneid as u64)) {
+                        let read_fd = pane.read_fd.as_mut().unwrap();
+                        let read = try_cont!(read_fd.read(&mut buf));
+                        if read == 0 {
+                            // No more input updates. The shell was probably closed.
+                            // TODO: There *has* to be a clean way to wait for pid
+                            // death, but I can't find one. The best I could find
+                            // was to dedicate a thread by pid to loop waitpid. WAT
+                            tmux_cmd!(master, "kill-pane -t {}", paneid)?;
+                            continue;
+                        }
+                        tmux_cmd!(master, "send-keys -t {} {}", paneid, to_hex(&buf[..read]))?;
+                    } else {
+                        // TODO: The pane got closed ?
+                    }
                 },
                 // A subwindow's size changed
                 Token(i) if token_is_subwindow_size(i) => {
                     let paneid = token_to_pane(i);
-                    println!("Got data from {} in subwindow_size", paneid);
+                    let size_fd = panes.get_mut(&(paneid as u64)).unwrap().size_fd.as_mut().unwrap();
+                    let mut thisbuf = vec![0u8; std::mem::size_of::<winsize>()];
+                    let read = try_cont!(size_fd.read(&mut thisbuf));
+                    if read == 0 {
+                        // No more window updates. I should probably deregister ?
+                        continue;
+                    } else if read != std::mem::size_of::<winsize>() {
+                        panic!("Got a partial read for subwindow_size. Not too
+                        sure how to handle that yet");
+                    }
+                    let size = thisbuf.as_ptr() as *const u8 as *const winsize;
+                    // TODO: We're supposed to send the size of the whole client
+                    // area, AKA the sum of every window.
+                    unsafe { tmux_cmd!(master, "refresh-client -C {},{}", (*size).ws_col, (*size).ws_row)? };
+                    unsafe { tmux_cmd!(master, "resize-pane -x {} -y {} -t %{}", (*size).ws_col, (*size).ws_row, paneid)? };
+                    unsafe { info!("Pixel density : {},{}", (*size).ws_xpixel / (*size).ws_col, (*size).ws_ypixel / (*size).ws_row) };
                 },
                 _ => panic!("WTF?")
             }
